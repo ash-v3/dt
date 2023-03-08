@@ -1,48 +1,79 @@
 import math
+import random
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 import gymnasium as gym
+from datetime import datetime
 from dt import DecisionTransformer
-from proc import StateProc
 from replay_buffer import ReplayBuffer
 
-EPOCHS = 1000
+TARGET_RETURN = 10000
+EPOCHS = 3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 env = gym.make("CarRacing-v2")
-obs_dim = env.observation_space.shape
-obs_dim = [obs_dim[2], obs_dim[0], obs_dim[1]]
+state_dim = env.observation_space.shape
+image_dim = [state_dim[2], state_dim[0], state_dim[1]]
 act_dim = env.action_space.shape[0]
-in_dim = 772
+encoding_dim = 768
 
-model = DecisionTransformer(in_dim=in_dim, n_heads=4)
-state_proc = StateProc()
+model = DecisionTransformer(state_dim=encoding_dim, act_dim=act_dim)
 replay_buffer = ReplayBuffer()
 
 observation, info = env.reset()
 
 for e in range(EPOCHS):
-    observation = env.reset()
-    action = torch.zeros(act_dim, dtype=torch.float32)
-    reward = torch.tensor([0], dtype=torch.float32)
-    obs = torch.tensor(observation[0], dtype=torch.float32).reshape(obs_dim)
-    obs = state_proc(obs, action, torch.tensor([reward]))
-    print(obs.shape)
-    hist = obs
+    state, _ = env.reset()
+    actions = torch.zeros((1, 1, act_dim), device=device, dtype=torch.float32)
+    rewards = torch.zeros(1, 1, device=device, dtype=torch.float32)
+    encoding = model.proc_state(observation)
+    states = encoding.reshape(1, 1, encoding_dim).to(device=device, dtype=torch.float32)
+    target_return = torch.tensor(TARGET_RETURN, dtype=torch.float32).reshape(1, 1, 1)
+    timesteps = torch.tensor(0, device=device, dtype=torch.long).reshape(1, 1)
+    attention_mask = torch.zeros(1, 1, device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        state_preds, action_preds, return_preds = model(
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            returns_to_go=target_return,
+            timesteps=timesteps,
+            attention_mask=attention_mask,
+            return_dict=False,
+        )
 
-    i = 0
     terminated = truncated = False
     while not (terminated or truncated):
-        action = model(hist).detach().numpy()[0][-act_dim:] # later make get action instead of just last
-        observation, reward, terminated, truncated, info = env.step(action)
-        obs = torch.tensor(observation, dtype=torch.float32).reshape(obs_dim)
-        obs = state_proc(obs, torch.tensor(action), torch.tensor([reward]))
-        hist = torch.cat([hist, obs])
-        i += 1
-        if i % 10 == 0:
-            terminated = True
-        print(hist.shape, action.shape, obs.shape, replay_buffer.buffer.shape)
+        with torch.inference_mode():
+            state_preds, action_preds, return_preds = model(
+                states=states,
+                actions=actions,
+                rewards=rewards,
+                returns_to_go=target_return,
+                timesteps=timesteps,
+                attention_mask=attention_mask,
+                return_dict=False,
+            )
 
-    replay_buffer.cat(hist)
+            action = action_preds.squeeze().numpy()
+
+        observation, reward, terminated, truncated, info = env.step(action)
+
+        actions = torch.cat([actions, torch.from_numpy(action).reshape([1, 1, act_dim])], dim=1)
+        rewards = torch.cat([rewards, torch.tensor([reward]).unsqueeze(0)], dim=0)
+        encoding = model.proc_state(observation)
+        print(target_return.shape, return_preds.shape)
+        target_return = torch.cat([target_return, return_preds], dim=1)
+        states = torch.cat([states, encoding.reshape([1, 1, encoding_dim])], dim=1)
+
+        if random.randint(1, 20) > 19:
+            terminated = True
+
+    replay_buffer.cat({"states": states, "actions": actions, "rewards": rewards})
+    print(replay_buffer.buffer[0])
+
+now = datetime.now()
+torch.save(replay_buffer, "saved_buffer" + now.strftime("-%H-%M-%S") + ".pt")
+torch.save(model, "model.pt")
